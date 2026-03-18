@@ -11113,12 +11113,7 @@ function runRothC(soc0_tha, clay_pct, pH, cin_annual, tillage_mult, climate_mont
     for (let mo = 0; mo < 12; mo++) {
       const clim = climate_monthly[mo % 12];
       pools = stepMonth(pools, cin_per_mo, { ...clim, irrig_mult: irrig }, clay_pct, pH,
-        tillage_mult * k_mult > 0 ? tillage_mult : 1.0);
-      // Override K_REF via k_mult for uncertainty
-      if (k_mult !== 1.0) {
-        // Already applied via tillage_mult × k_mult trick — but we need a cleaner way
-        // Re-apply the k_mult by noting the above is wrong — let me use a wrapper
-      }
+        tillage_mult * k_mult);
     }
     if (yr === 1) pools_after_yr1 = { ...pools };
     trajectory.push({ year: yr, soc: totalSOC(pools) });
@@ -12650,7 +12645,17 @@ async function submitAssessment() {
       }
     } else {
       const err = await resp.text();
-      showToast('Submit failed: ' + resp.status);
+      const statusMessages = {
+        400: 'Invalid data — please check all fields',
+        401: 'Authorization failed — check configuration',
+        403: 'Permission denied — contact administrator',
+        409: 'Duplicate entry — assessment may already exist',
+        422: 'Validation error — some fields have invalid values',
+        500: 'Server error — please try again later',
+        503: 'Service unavailable — please try again later',
+      };
+      const msg = statusMessages[resp.status] || `Submit failed (${resp.status})`;
+      showToast('⚠ ' + msg);
       console.error('Supabase error:', err);
       if (btn) { btn.disabled = false; btn.textContent = '☁ Submit'; }
     }
@@ -13044,8 +13049,10 @@ async function runSolver() {
 
   document.getElementById('pareto-section').style.display = 'flex';
   document.getElementById('p3-pdf-section').style.display = 'flex';
-  document.getElementById('p3-header-status').textContent =
-    `✓ ${regenResults.length} regen · ${biocharResults.length} biochar · ${combinedResults.length} combined bundles`;
+  const totalResults = regenResults.length + biocharResults.length + combinedResults.length;
+  document.getElementById('p3-header-status').textContent = totalResults > 0
+    ? `✓ ${regenResults.length} regen · ${biocharResults.length} biochar · ${combinedResults.length} combined bundles`
+    : '⚠ No feasible pathways found — try adjusting the target or timeline';
   // Item C: show MRV protocol panel
   const mrvWrap = document.getElementById('mrv-protocol-wrap');
   if (mrvWrap) mrvWrap.style.display = 'block';
