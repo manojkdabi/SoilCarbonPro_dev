@@ -1,0 +1,69 @@
+// Supabase Edge Function: wcs-proxy  v3
+// Proxies ISRIC SoilGrids WCS (maps.isric.org) server-side.
+// Returns raw binary (image/tiff) — client reads with resp.arrayBuffer().
+// No base64, no external imports beyond serve. Simple and reliable.
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin":  "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const ALLOWED_HOSTS = ["maps.isric.org", "rest.isric.org"];
+
+serve(async (req) => {
+  // Preflight — must return 200 OK with CORS headers
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: CORS_HEADERS });
+  }
+
+  try {
+    const { url } = await req.json();
+
+    if (!url || typeof url !== "string") {
+      return new Response(
+        JSON.stringify({ error: "url string required" }),
+        { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Security: only allow ISRIC domains
+    const parsed = new URL(url);
+    if (!ALLOWED_HOSTS.includes(parsed.hostname)) {
+      return new Response(
+        JSON.stringify({ error: `Host not allowed: ${parsed.hostname}` }),
+        { status: 403, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    const upstream = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!upstream.ok) {
+      return new Response(
+        JSON.stringify({ error: `ISRIC returned ${upstream.status}` }),
+        { status: upstream.status,
+          headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Return raw binary — client calls resp.arrayBuffer() directly
+    const buffer = await upstream.arrayBuffer();
+    return new Response(buffer, {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": "image/tiff",
+      },
+    });
+
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ error: e.message }),
+      { status: 500, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+    );
+  }
+});
