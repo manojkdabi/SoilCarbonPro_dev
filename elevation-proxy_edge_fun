@@ -1,0 +1,68 @@
+// Supabase Edge Function: elevation-proxy
+// Deploy with: supabase functions deploy elevation-proxy
+//
+// Proxies OpenTopoData SRTM30m requests server-side — no CORS restrictions.
+// Called by fetchElevationBatch() in the tool when SCP_ENV !== 'local'.
+//
+// Request:  POST /functions/v1/elevation-proxy
+//           Body: { "locations": "lat1,lon1|lat2,lon2|..." }
+// Response: { "results": [{elevation, location:{lat,lng}}, ...] }
+//           or { "error": "message" }
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin":  "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+serve(async (req) => {
+  // Handle preflight
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: CORS_HEADERS });
+  }
+
+  try {
+    const { locations } = await req.json();
+    if (!locations || typeof locations !== "string") {
+      return new Response(
+        JSON.stringify({ error: "locations string required" }),
+        { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Validate: max 100 points per call (OpenTopoData limit)
+    const pointCount = locations.split("|").length;
+    if (pointCount > 100) {
+      return new Response(
+        JSON.stringify({ error: `Max 100 points per request, got ${pointCount}` }),
+        { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    const url = `https://api.opentopodata.org/v1/srtm30m?locations=${encodeURIComponent(locations)}`;
+    const upstream = await fetch(url, {
+      signal: AbortSignal.timeout(25000),
+    });
+
+    if (!upstream.ok) {
+      return new Response(
+        JSON.stringify({ error: `OpenTopoData returned ${upstream.status}` }),
+        { status: upstream.status, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    const data = await upstream.json();
+    return new Response(
+      JSON.stringify(data),
+      { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+    );
+
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ error: e.message }),
+      { status: 500, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+    );
+  }
+});
