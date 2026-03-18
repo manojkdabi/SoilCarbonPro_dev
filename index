@@ -208,7 +208,7 @@ body {
   text-transform: uppercase;
 }
 #map {
-  height: 200px;
+  height: 380px;
   border-radius: var(--radius);
   border: 1px solid var(--paper-3);
   cursor: crosshair;
@@ -2294,8 +2294,9 @@ svg.gauge { width: 100%; overflow: visible; }
       <!-- Satellite / imagery layer controls -->
       <div class="sat-controls" id="sat-controls">
         <span class="sat-opacity-label">LAYER:</span>
-        <button class="sat-btn active" id="sat-btn-osm"  onclick="setSatLayer('osm')">OSM</button>
-        <button class="sat-btn"        id="sat-btn-esri" onclick="setSatLayer('esri')">🛰 Esri Imagery</button>
+        <button class="sat-btn active" id="sat-btn-osm"     onclick="setSatLayer('osm')">OSM</button>
+        <button class="sat-btn"        id="sat-btn-esri"    onclick="setSatLayer('esri')">🛰 Esri Imagery</button>
+        <button class="sat-btn"        id="sat-btn-clarity" onclick="setSatLayer('clarity')">🔍 Hi-Res</button>
         <span class="sat-opacity-label" id="sat-res-note" style="margin-left:auto"></span>
       </div>
 
@@ -3963,7 +3964,13 @@ const _layers = {
   esri: L.tileLayer(
     'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
     attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics',
-    maxZoom: 19
+    maxNativeZoom: 19, maxZoom: 22,
+  }),
+  clarity: L.tileLayer(
+    'https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics (Clarity)',
+    // maxNativeZoom 19; maxZoom 22 enables over-zoom for sub-field boundary delineation
+    maxNativeZoom: 19, maxZoom: 22,
   }),
 };
 
@@ -3971,14 +3978,18 @@ let _currentLayer = 'osm';
 _layers.osm.addTo(map);
 
 function setSatLayer(key) {
-  ['osm','esri'].forEach(k => {
+  ['osm','esri','clarity'].forEach(k => {
     document.getElementById(`sat-btn-${k}`)?.classList.toggle('active', k === key);
   });
   Object.values(_layers).forEach(l => { if (map.hasLayer(l)) map.removeLayer(l); });
   _currentLayer = key;
   _layers[key].addTo(map);
-  document.getElementById('sat-res-note').textContent =
-    key === 'esri' ? '0.3–15 m · Esri Maxar composite' : '';
+  const notes = {
+    esri:    '0.3–15 m · Esri Maxar composite · zoom ≤19',
+    clarity: '0.3–15 m · Esri Clarity · zoom ≤19 native · 20–22 upsampled',
+    osm:     '',
+  };
+  document.getElementById('sat-res-note').textContent = notes[key] ?? '';
 }
 
 /* ═══════════════════════════════════════════════════════
