@@ -1,0 +1,274 @@
+/* ═══════════════════════════════════════════════════════════════════
+   SOILCARBON PRO — SUPABASE COMPLETE SETUP
+   
+   Run this entire file in Supabase SQL Editor:
+   supabase.com → your project → SQL Editor → New query → paste → Run
+   
+   Creates:
+     1. assessments          — one row per farm submission
+     2. agents               — field personnel registry
+     3. farmers              — farmer registry
+     4. lab_results          — soil lab results linked to assessment
+     5. assessment_summary   — clean view for dashboards
+     6. RLS policies         — anonymous insert, authenticated read
+═══════════════════════════════════════════════════════════════════ */
+
+-- ─────────────────────────────────────────────────────────────────
+-- 1. AGENTS TABLE
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agents (
+  id            BIGSERIAL PRIMARY KEY,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  name          TEXT NOT NULL,
+  phone         TEXT UNIQUE,
+  email         TEXT UNIQUE,
+  organisation  TEXT,
+  district      TEXT,
+  state         TEXT,
+  active        BOOLEAN DEFAULT true
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- 2. FARMERS TABLE
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS farmers (
+  id              BIGSERIAL PRIMARY KEY,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  name            TEXT NOT NULL,
+  phone           TEXT,
+  village         TEXT,
+  taluka          TEXT,
+  district        TEXT,
+  state           TEXT,
+  khasra_number   TEXT,   -- land parcel ID (Survey / Khasra no.)
+  land_area_ha    NUMERIC(8,2),
+  consent_given   BOOLEAN DEFAULT false,
+  consent_date    DATE
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- 3. ASSESSMENTS TABLE (main table — one row per tool submission)
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS assessments (
+  id                  BIGSERIAL PRIMARY KEY,
+  submitted_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  -- Identity
+  agent_id            BIGINT REFERENCES agents(id),
+  farmer_id           BIGINT REFERENCES farmers(id),
+  agent_name          TEXT,       -- fallback if agent not pre-registered
+  farmer_name         TEXT,       -- fallback if farmer not pre-registered
+  village             TEXT,
+  district            TEXT,
+  state               TEXT,
+  khasra_number       TEXT,
+
+  -- Location
+  location_name       TEXT,
+  lat                 NUMERIC(9,6),
+  lon                 NUMERIC(9,6),
+  field_area_ha       NUMERIC(8,2),
+  boundary_geojson    JSONB,      -- field polygon GeoJSON
+
+  -- Soil baseline (SoilGrids or lab — see lab_results for lab values)
+  mineralogy          TEXT,
+  analysis_depth_cm   INTEGER,
+  soc_baseline_pct    NUMERIC(5,3),
+  cstock_tha          NUMERIC(6,2),
+  clay_pct            NUMERIC(5,1),
+  ph                  NUMERIC(4,2),
+  bulk_density        NUMERIC(4,3),
+  cec_cmolkg          NUMERIC(6,2),
+  data_source         TEXT DEFAULT 'soilgrids',  -- 'soilgrids' | 'lab' | 'manual'
+
+  -- CDR targets & results
+  target_tha          NUMERIC(6,2),
+  target_year         INTEGER,
+  bau_endpoint_tha    NUMERIC(6,2),
+  feas_score          NUMERIC(4,1),
+  pathway_awg         BOOLEAN,    -- AWD eligible
+  pathway_erw         BOOLEAN,    -- ERW eligible
+  pathway_biochar     BOOLEAN,    -- Biochar eligible
+  pathway_regen       BOOLEAN,    -- Regen Ag eligible
+
+  -- Farm system
+  crop_rotation       TEXT,
+  tillage             TEXT,
+  irrigation          TEXT,
+  trees               TEXT,
+  tree_area_frac      NUMERIC(4,2),
+  waterlogging        TEXT,
+
+  -- MRV protocol
+  mrv_composites      INTEGER,
+  mrv_subsamples      INTEGER,
+  mrv_timing          TEXT,
+  soc_uncertainty_pct NUMERIC(5,1),
+  soc_cv_pct          NUMERIC(5,1),
+
+  -- Spatial analysis
+  interp_mode         TEXT,       -- 'idw' | 'ok' | 'rk'
+  rk_r2               NUMERIC(4,3),
+  pixel_count         INTEGER,
+
+  -- Terrain (if terrain analysis was run)
+  dem_source          TEXT,
+  slope_mean_deg      NUMERIC(5,2),
+  slope_max_deg       NUMERIC(5,2),
+  twi_mean            NUMERIC(5,2),
+  terrain_flags       TEXT,       -- comma-separated cross-validation flags
+
+  -- Status tracking
+  status              TEXT DEFAULT 'submitted',
+    -- 'submitted' | 'reviewed' | 'lab_pending' | 'lab_received' | 'enrolled' | 'rejected'
+  reviewer_notes      TEXT,
+  reviewed_at         TIMESTAMPTZ,
+  reviewed_by         TEXT,
+
+  -- Full session snapshot (for audit / reprocessing)
+  session_json        JSONB
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- 4. LAB RESULTS TABLE
+-- ─────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS lab_results (
+  id                BIGSERIAL PRIMARY KEY,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  assessment_id     BIGINT REFERENCES assessments(id) ON DELETE CASCADE,
+
+  -- Sample metadata
+  sample_date       DATE,
+  lab_name          TEXT,
+  lab_report_ref    TEXT,
+  depth_cm_from     INTEGER,
+  depth_cm_to       INTEGER,
+
+  -- Measured values (overrides SoilGrids when present)
+  soc_pct           NUMERIC(5,3),     -- Walkley-Black or TOC
+  bulk_density      NUMERIC(4,3),     -- g/cm³
+  ph_water          NUMERIC(4,2),
+  clay_pct          NUMERIC(5,1),
+  ec_dscm           NUMERIC(6,3),     -- electrical conductivity
+  cec_cmolkg        NUMERIC(6,2),
+  total_nitrogen_pct NUMERIC(5,3),
+  available_p_kgha  NUMERIC(7,2),
+  exchangeable_k_kgha NUMERIC(7,2),
+
+  -- Derived
+  cstock_tha        NUMERIC(6,2) GENERATED ALWAYS AS
+    (ROUND((soc_pct / 100.0 * bulk_density * (depth_cm_to - depth_cm_from) * 10000.0 / 1000.0)::numeric, 2))
+    STORED,
+
+  notes             TEXT
+);
+
+-- ─────────────────────────────────────────────────────────────────
+-- 5. INDEXES
+-- ─────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_assessments_submitted   ON assessments (submitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_assessments_location    ON assessments (lat, lon);
+CREATE INDEX IF NOT EXISTS idx_assessments_district    ON assessments (district, state);
+CREATE INDEX IF NOT EXISTS idx_assessments_status      ON assessments (status);
+CREATE INDEX IF NOT EXISTS idx_assessments_farmer      ON assessments (farmer_id);
+CREATE INDEX IF NOT EXISTS idx_lab_assessment          ON lab_results (assessment_id);
+
+-- ─────────────────────────────────────────────────────────────────
+-- 6. ROW LEVEL SECURITY
+-- ─────────────────────────────────────────────────────────────────
+ALTER TABLE assessments  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agents       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE farmers      ENABLE ROW LEVEL SECURITY;
+ALTER TABLE lab_results  ENABLE ROW LEVEL SECURITY;
+
+-- Anonymous (field agents with the URL) — can INSERT assessments and farmers
+CREATE POLICY "anon_insert_assessments" ON assessments
+  FOR INSERT WITH CHECK (true);
+
+CREATE POLICY "anon_insert_farmers" ON farmers
+  FOR INSERT WITH CHECK (true);
+
+-- Authenticated users (MRV officers, you) — full read/write
+CREATE POLICY "auth_all_assessments" ON assessments
+  FOR ALL USING (auth.role() = 'authenticated');
+
+CREATE POLICY "auth_all_agents" ON agents
+  FOR ALL USING (auth.role() = 'authenticated');
+
+CREATE POLICY "auth_all_farmers" ON farmers
+  FOR ALL USING (auth.role() = 'authenticated');
+
+CREATE POLICY "auth_all_lab" ON lab_results
+  FOR ALL USING (auth.role() = 'authenticated');
+
+-- ─────────────────────────────────────────────────────────────────
+-- 7. SUMMARY VIEW (for dashboards and quick queries)
+-- ─────────────────────────────────────────────────────────────────
+CREATE OR REPLACE VIEW assessment_summary AS
+SELECT
+  a.id,
+  a.submitted_at::date                      AS date,
+  a.status,
+  a.agent_name,
+  a.farmer_name,
+  a.village,
+  a.district,
+  a.state,
+  ROUND(a.lat::numeric, 4)                  AS lat,
+  ROUND(a.lon::numeric, 4)                  AS lon,
+  a.field_area_ha,
+  a.mineralogy,
+  a.soc_baseline_pct,
+  a.cstock_tha,
+  -- Use lab value if available, otherwise SoilGrids
+  COALESCE(lr.soc_pct,   a.soc_baseline_pct)     AS soc_verified_pct,
+  COALESCE(lr.cstock_tha, a.cstock_tha)           AS cstock_verified_tha,
+  a.target_tha,
+  a.target_year,
+  ROUND((a.target_tha - a.cstock_tha)::numeric, 2) AS uplift_needed_tha,
+  a.feas_score,
+  a.crop_rotation,
+  a.pathway_awg,
+  a.pathway_biochar,
+  a.pathway_regen,
+  a.pathway_erw,
+  a.soc_cv_pct,
+  a.interp_mode,
+  a.slope_mean_deg,
+  a.twi_mean,
+  lr.id IS NOT NULL                         AS has_lab_result,
+  a.data_source
+FROM assessments a
+LEFT JOIN lab_results lr ON lr.assessment_id = a.id
+ORDER BY a.submitted_at DESC;
+
+-- ─────────────────────────────────────────────────────────────────
+-- 8. USEFUL QUERIES (run these anytime in SQL Editor)
+-- ─────────────────────────────────────────────────────────────────
+
+-- Total farms and CDR potential by district:
+-- SELECT district, COUNT(*) AS farms,
+--        ROUND(AVG(cstock_tha)::numeric,2) AS avg_cstock,
+--        ROUND(SUM(field_area_ha * (target_tha - cstock_tha))::numeric,1) AS total_uplift_t
+-- FROM assessment_summary
+-- WHERE status NOT IN ('rejected')
+-- GROUP BY district ORDER BY total_uplift_t DESC;
+
+-- Farms ready for enrollment (reviewed + lab received):
+-- SELECT farmer_name, village, district, field_area_ha, feas_score, crop_rotation
+-- FROM assessments
+-- WHERE status = 'lab_received' AND feas_score >= 6
+-- ORDER BY feas_score DESC;
+
+-- Pipeline tracker:
+-- SELECT status, COUNT(*) AS count, ROUND(SUM(field_area_ha)::numeric,1) AS total_ha
+-- FROM assessments GROUP BY status ORDER BY count DESC;
+
+-- Spatial cluster — nearby high-potential fields:
+-- SELECT id, farmer_name, lat, lon, cstock_tha, feas_score
+-- FROM assessments
+-- WHERE ST_DWithin(
+--   ST_MakePoint(lon, lat)::geography,
+--   ST_MakePoint(78.96, 21.14)::geography,  -- replace with your project centroid
+--   10000  -- 10km radius
+-- );
