@@ -6202,13 +6202,25 @@ function applySatelliteResult(data) {
 
   // ── 1. Build 12-month climatology (mean NDVI per calendar month) ──────
   const moSum = new Array(12).fill(0), moCnt = new Array(12).fill(0);
+  const ndwiSum = new Array(12).fill(0), ndwiCnt = new Array(12).fill(0);
+  const ndreSum = new Array(12).fill(0), ndreCnt = new Array(12).fill(0);
   data.forEach(d => {
     if (!d.valid || d.ndvi_mean === null) return;
     const mo = parseInt(d.date.slice(5,7)) - 1;  // 0-indexed
     moSum[mo] += d.ndvi_mean;
     moCnt[mo]++;
+    if (d.ndwi_mean !== null && d.ndwi_mean !== undefined) {
+      ndwiSum[mo] += d.ndwi_mean;
+      ndwiCnt[mo]++;
+    }
+    if (d.ndre_mean !== null && d.ndre_mean !== undefined) {
+      ndreSum[mo] += d.ndre_mean;
+      ndreCnt[mo]++;
+    }
   });
   const ndviClim = moSum.map((s,i) => moCnt[i] ? s/moCnt[i] : null);
+  const ndwiClim = ndwiSum.map((s,i) => ndwiCnt[i] ? s/ndwiCnt[i] : null);
+  const ndreClim = ndreSum.map((s,i) => ndreCnt[i] ? s/ndreCnt[i] : null);
 
   // ── 2. Compute NPP via fPAR → APAR → GPP chain ───────────────────────
   //    Uses ST.climate.monthly.rs (ERA5 shortwave, MJ/m²/month)
@@ -6294,11 +6306,13 @@ function applySatelliteResult(data) {
   ST.satData.satelliteCin = Cin_field;
   ST.satData.annualNPP    = annualNPP;
   ST.satData.ndviClim     = ndviClim;
+  ST.satData.ndwiClim     = ndwiClim;
+  ST.satData.ndreClim     = ndreClim;
 
   // ── 6. Render UI ───────────────────────────────────────────────────────
   renderNDVIChart(data, ndviClim);
   renderSatNPPStrip(annualNPP, Cin_field, Cin_ag, Cin_bg, Cin_rhizo, treeCin);
-  renderPhenologyClassification(ndviClim);
+  renderPhenologyClassification(ndviClim, ndwiClim, ndreClim);
   renderSatScaleStrip(scaleFactor, baseInterviewCin, Cin_field);
 
   // ── 7. Re-run RothC with satellite Cin ────────────────────────────────
@@ -6431,8 +6445,8 @@ function renderSatNPPStrip(NPP, Cin, Cin_ag, Cin_bg, Cin_rhizo, treeCin) {
     ` t C/ha/yr</span>`;
 }
 
-/* ── renderPhenologyClassification: crop type confidence from NDVI pattern ── */
-function renderPhenologyClassification(ndviClim) {
+/* ── renderPhenologyClassification: crop type confidence from NDVI + NDWI + NDRE pattern ── */
+function renderPhenologyClassification(ndviClim, ndwiClim, ndreClim) {
   const el = document.getElementById('sat-phenology');
   if (!el) return;
   const valid = ndviClim.map((v,i) => ({mo:i,v})).filter(x=>x.v!==null);
@@ -6456,6 +6470,46 @@ function renderPhenologyClassification(ndviClim) {
     phenoMatch = 'Ambiguous / mixed'; confidence = '45%'; matchedCrops = 'Multiple crops possible';
   }
 
+  // ── NDWI refinement: flooded-rice detection (monsoon Jun–Sep NDWI > 0.05) ──
+  let riceSignal = false;
+  let ndwiNote = '';
+  if (ndwiClim) {
+    const monsoonNDWI = [5,6,7,8].map(mo => ndwiClim[mo]).filter(v => v !== null); // Jun–Sep, 0-indexed
+    if (monsoonNDWI.length) {
+      const peakNDWI = Math.max(...monsoonNDWI);
+      if (peakNDWI > 0.05) {
+        riceSignal = true;
+        ndwiNote = `NDWI peak ${peakNDWI.toFixed(2)} (Jun–Sep) → flooded/irrigated signal`;
+        if (phenoMatch.includes('Kharif late')) {
+          matchedCrops = 'Rice (flooded · high confidence), Cotton, Pigeon pea';
+          confidence = '82%';
+        }
+      }
+    }
+  }
+
+  // ── NDRE refinement: wheat vs mustard separation (Rabi Nov–Feb NDRE) ──
+  let ndreNote = '';
+  if (ndreClim && phenoMatch.includes('Rabi')) {
+    const rabiNDRE = [10,11,0,1].map(mo => ndreClim[mo]).filter(v => v !== null); // Nov–Feb, 0-indexed (wraps year)
+    if (rabiNDRE.length) {
+      const meanRabiNDRE = rabiNDRE.reduce((a,b)=>a+b,0) / rabiNDRE.length;
+      if (meanRabiNDRE > 0.22) {
+        matchedCrops = 'Wheat (high NDRE · dense canopy), Chickpea';
+        confidence = '85%';
+        ndreNote = `mean Rabi NDRE ${meanRabiNDRE.toFixed(2)} → dense cereal canopy`;
+      } else if (meanRabiNDRE > 0.14) {
+        matchedCrops = 'Mustard / Rapeseed, Wheat, Chickpea';
+        confidence = '80%';
+        ndreNote = `mean Rabi NDRE ${meanRabiNDRE.toFixed(2)} → moderate canopy`;
+      } else {
+        ndreNote = `mean Rabi NDRE ${meanRabiNDRE.toFixed(2)}`;
+      }
+    }
+  }
+
+  const bandNotes = [ndwiNote, ndreNote].filter(Boolean).join(' · ');
+
   // Check against interview
   const interviewCrop = ST.farm.crops[0]?.id;
   const interviewSeason = CROPS[interviewCrop]?.season;
@@ -6474,6 +6528,7 @@ function renderPhenologyClassification(ndviClim) {
      <strong>${MONTH_NAMES[peakMo]}</strong> &ensp;
      Pattern: <strong>${phenoMatch}</strong> (confidence: ${confidence})<br>` +
     `<span style="color:var(--ink-5);font-size:0.62rem">Likely crops: ${matchedCrops}</span>` +
+    (bandNotes ? `<br><span style="color:var(--ink-5);font-size:0.60rem">🛰 ${bandNotes}</span>` : '') +
     (seasonMatch !== null ? `<br><span style="color:${seasonMatch?'var(--green-2)':'var(--amber-2)'}">
        ${seasonMatch ? '✓ Matches' : '⚠ Differs from'} interview crop season (${interviewSeason})</span>` : '');
 }
