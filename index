@@ -2482,6 +2482,13 @@ svg.gauge { width: 100%; overflow: visible; }
           <canvas id="sat-ndwi-chart" height="70"></canvas>
         </div>
 
+        <!-- NDRE time series chart -->
+        <div id="sat-ndre-wrap" style="display:none;margin-top:8px">
+          <div style="font-size:0.60rem;color:var(--ink-5);font-family:var(--mono);
+               margin-bottom:3px">MONTHLY NDRE · 5-YEAR RECORD · red-edge crop type signal (B07−B05)</div>
+          <canvas id="sat-ndre-chart" height="70"></canvas>
+        </div>
+
         <!-- NPP & Cin summary -->
         <div id="sat-npp-strip" style="display:none;margin-top:8px;
              font-size:0.68rem;font-family:var(--mono);line-height:1.8">
@@ -6137,6 +6144,7 @@ const PHENOLOGY = {
 
 let _satNDVIChart = null;  // Chart.js instance — destroyed & recreated on each fetch
 let _satNDWIChart = null;  // Chart.js instance for NDWI — destroyed & recreated on each fetch
+let _satNDREChart = null;  // Chart.js instance for NDRE — destroyed & recreated on each fetch
 
 /* ── triggerSatelliteAnalysis: entry point from 🛰 Vegetation button ── */
 async function triggerSatelliteAnalysis() {
@@ -6331,6 +6339,7 @@ function applySatelliteResult(data) {
   // ── 6. Render UI ───────────────────────────────────────────────────────
   renderNDVIChart(data, ndviClim);
   renderNDWIChart(data, ndwiClim);
+  renderNDREChart(data, ndreClim);
   renderSatNPPStrip(annualNPP, Cin_field, Cin_ag, Cin_bg, Cin_rhizo, treeCin);
   renderPhenologyClassification(ndviClim, ndwiClim, ndreClim);
   renderSatScaleStrip(scaleFactor, baseInterviewCin, Cin_field);
@@ -6543,6 +6552,124 @@ function renderNDWIChart(data, ndwiClim) {
              // NDWI range: dry bare soil ≈ −0.3; dense dry canopy ≈ 0; flooded/irrigated ≥ 0.05; open water > 0.3
              title: { display: true, text: 'NDWI', font:{size:9} },
              ticks: { stepSize: 0.2, font:{size:9} },
+             grid: { color: 'rgba(0,0,0,0.05)' } },
+        x: { ticks: { font:{size:9} }, grid: { display: false } }
+      }
+    }
+  });
+}
+
+/* ── renderNDREChart: 5-year monthly NDRE time series ── */
+function renderNDREChart(data, ndreClim) {
+  const wrap   = document.getElementById('sat-ndre-wrap');
+  const canvas = document.getElementById('sat-ndre-chart');
+  if (!wrap || !canvas) return;
+
+  // Hide and bail if no NDRE data in this response (old cached data without B05/B07)
+  const hasNDRE = data && data.some(d => d.ndre_mean !== null && d.ndre_mean !== undefined);
+  if (!hasNDRE || !ndreClim) { wrap.style.display = 'none'; return; }
+
+  if (typeof Chart === 'undefined') {
+    let waited = 0;
+    const check = setInterval(() => {
+      waited += 100;
+      if (typeof Chart !== 'undefined') { clearInterval(check); renderNDREChart(data, ndreClim); }
+      else if (waited > 3000) { clearInterval(check); }
+    }, 100);
+    return;
+  }
+
+  wrap.style.display = 'block';
+  if (_satNDREChart) { _satNDREChart.destroy(); _satNDREChart = null; }
+
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const climData = ndreClim.map(v => v !== null ? parseFloat(v.toFixed(3)) : null);
+
+  // Per-year traces
+  const years = [...new Set(data.map(d => d.date.slice(0,4)))].sort().slice(-5);
+  const yearDatasets = years.map((yr, i) => {
+    const vals = new Array(12).fill(null);
+    data.filter(d => d.date.startsWith(yr)).forEach(d => {
+      if (d.ndre_mean !== null && d.ndre_mean !== undefined) {
+        const mo = parseInt(d.date.slice(5,7)) - 1;
+        vals[mo] = parseFloat(d.ndre_mean.toFixed(3));
+      }
+    });
+    const alpha = 0.25 + (i / years.length) * 0.35;
+    return {
+      label:           yr,
+      data:            vals,
+      borderColor:     `rgba(100,60,160,${alpha})`,
+      backgroundColor: 'transparent',
+      borderWidth:     1,
+      pointRadius:     2,
+      tension:         0.3,
+      spanGaps:        true,
+    };
+  });
+
+  // Wheat/dense cereal threshold reference line at NDRE = 0.22
+  // (Rabi mean NDRE > 0.22 → Wheat / dense cereal canopy, 85% confidence)
+  const wheatThreshData = new Array(12).fill(0.22);
+  // Mustard/wheat mix lower bound at NDRE = 0.14
+  const mustardThreshData = new Array(12).fill(0.14);
+
+  _satNDREChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: MONTH_NAMES,
+      datasets: [
+        ...yearDatasets,
+        {
+          label:           '5-yr mean',
+          data:            climData,
+          borderColor:     '#6a3ca0',
+          backgroundColor: 'rgba(106,60,160,0.08)',
+          borderWidth:     2.5,
+          pointRadius:     3,
+          tension:         0.3,
+          spanGaps:        true,
+          fill:            true,
+        },
+        {
+          label:           'Wheat/cereal (0.22)',
+          data:            wheatThreshData,
+          borderColor:     'rgba(200,80,20,0.55)',
+          backgroundColor: 'transparent',
+          borderWidth:     1,
+          borderDash:      [4, 3],
+          pointRadius:     0,
+          tension:         0,
+          fill:            false,
+        },
+        {
+          label:           'Mustard/wheat mix (0.14)',
+          data:            mustardThreshData,
+          borderColor:     'rgba(200,160,20,0.55)',
+          backgroundColor: 'transparent',
+          borderWidth:     1,
+          borderDash:      [2, 3],
+          pointRadius:     0,
+          tension:         0,
+          fill:            false,
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { display: true, position: 'top',
+                  labels: { font:{size:9}, color:'var(--ink-3)', padding:8 } },
+        tooltip: { callbacks: {
+          label: ctx => ` ${ctx.dataset.label}: NDRE ${ctx.parsed.y?.toFixed(2) ?? 'N/A'}`
+        }}
+      },
+      scales: {
+        y: { min: -0.1, max: 0.5,
+             // NDRE range: bare soil ≈ -0.05–0.05; sparse veg ≈ 0.05–0.14; moderate ≈ 0.14–0.22; dense canopy > 0.22
+             title: { display: true, text: 'NDRE', font:{size:9} },
+             ticks: { stepSize: 0.1, font:{size:9} },
              grid: { color: 'rgba(0,0,0,0.05)' } },
         x: { ticks: { font:{size:9} }, grid: { display: false } }
       }
