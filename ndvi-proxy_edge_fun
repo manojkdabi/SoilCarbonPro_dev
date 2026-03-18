@@ -1,0 +1,190 @@
+// Supabase Edge Function: ndvi-proxy  v3
+// Sprint 5A — Sentinel Hub Statistics API, monthly NDVI
+//
+// v3 fixes:
+//   - evaluatePixel now returns OBJECT {ndvi:[v], dataMask:[1/0]}
+//     NOT array [v, mask] — Statistics API v3 requires named object
+//   - Removed dataFilter.mosaickingOrder (Process API field, not Statistics)
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin":  "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const SH_TOKEN_URL = "https://services.sentinel-hub.com/oauth/token";
+const SH_STATS_URL = "https://services.sentinel-hub.com/api/v1/statistics";
+
+// Evalscript v3 for Statistics API
+// Rules:
+//   setup()          → declare ALL outputs including dataMask
+//   evaluatePixel()  → return OBJECT with named arrays, e.g. {ndvi:[v], dataMask:[1]}
+//   dataMask         → UINT8, 0=exclude pixel, 1=include pixel
+//   SCL cloud mask   → exclude classes 0,1,3,8,9,10,11
+//   units DN         → S2 L2A integer reflectance (0-10000); NDVI formula is scale-invariant
+const EVALSCRIPT = `//VERSION=3
+function setup() {
+  return {
+    input: [{ bands: ["B04", "B08", "SCL"], units: "DN" }],
+    output: [
+      { id: "ndvi",     bands: 1, sampleType: "FLOAT32" },
+      { id: "dataMask", bands: 1, sampleType: "UINT8"   }
+    ],
+    mosaicking: "ORBIT"
+  };
+}
+function evaluatePixel(samples) {
+  var valid = [];
+  for (var i = 0; i < samples.length; i++) {
+    var scl = samples[i].SCL;
+    if (scl===0||scl===1||scl===3||scl===8||scl===9||scl===10||scl===11) continue;
+    var nir = samples[i].B08;
+    var red = samples[i].B04;
+    var d   = nir + red;
+    if (d > 0) valid.push((nir - red) / d);
+  }
+  if (valid.length === 0) {
+    return { ndvi: [NaN], dataMask: [0] };
+  }
+  var sum = 0;
+  for (var j = 0; j < valid.length; j++) sum += valid[j];
+  return { ndvi: [sum / valid.length], dataMask: [1] };
+}`;
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: CORS_HEADERS });
+  }
+
+  try {
+    const body = await req.json();
+    const { clientId, clientSecret, bbox, startDate, endDate } = body;
+
+    if (!clientId || !clientSecret) {
+      return new Response(
+        JSON.stringify({ error: "clientId and clientSecret required" }),
+        { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+    if (!bbox || bbox.length !== 4) {
+      return new Response(
+        JSON.stringify({ error: "bbox [lon_min,lat_min,lon_max,lat_max] required" }),
+        { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    const start = startDate || "2020-01-01";
+    const end   = endDate   || new Date().toISOString().slice(0, 10);
+
+    // ── Step 1: OAuth token ────────────────────────────────────────────
+    const tokenResp = await fetch(SH_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body:    `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`,
+      signal:  AbortSignal.timeout(15000),
+    });
+    if (!tokenResp.ok) {
+      const err = await tokenResp.text();
+      return new Response(
+        JSON.stringify({ error: `SH auth failed (${tokenResp.status}): ${err.slice(0, 200)}` }),
+        { status: 401, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+    const { access_token: token } = await tokenResp.json();
+    if (!token) {
+      return new Response(
+        JSON.stringify({ error: "No access_token in SH response" }),
+        { status: 401, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // ── Step 2: Statistics API ─────────────────────────────────────────
+    // dataFilter has NO mosaickingOrder — that field is Process API only.
+    // Statistics API with ORBIT mosaicking processes each orbit separately.
+    const statsPayload = {
+      input: {
+        bounds: {
+          bbox,
+          properties: { crs: "http://www.opengis.net/def/crs/OGC/1.3/CRS84" }
+        },
+        data: [{
+          type:       "sentinel-2-l2a",
+          dataFilter: { maxCloudCoverage: 80 }
+        }]
+      },
+      aggregation: {
+        timeRange: {
+          from: `${start}T00:00:00Z`,
+          to:   `${end}T23:59:59Z`
+        },
+        aggregationInterval: { of: "P1M" },
+        evalscript: EVALSCRIPT,
+        resx: 10,
+        resy: 10
+      },
+      calculations: {
+        ndvi: {
+          statistics: {
+            default: {
+              percentiles: { k: [25, 75] }
+            }
+          }
+        }
+      }
+    };
+
+    const statsResp = await fetch(SH_STATS_URL, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body:    JSON.stringify(statsPayload),
+      signal:  AbortSignal.timeout(30000),
+    });
+
+    if (!statsResp.ok) {
+      const err = await statsResp.text();
+      return new Response(
+        JSON.stringify({ error: `SH Statistics failed (${statsResp.status}): ${err.slice(0, 400)}` }),
+        { status: statsResp.status, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+      );
+    }
+
+    // ── Step 3: Parse response ─────────────────────────────────────────
+    // Response: item.outputs.ndvi.bands.B0.stats.{mean, percentiles, sampleCount, noDataCount}
+    // Percentile keys may be "25.0" or "25" depending on SH version — handle both.
+    const statsData = await statsResp.json();
+    const intervals = statsData.data || [];
+
+    const data = intervals.map((item) => {
+      const dateStr = item.interval?.from?.slice(0, 7) || "";
+      const band    = item.outputs?.ndvi?.bands?.B0?.stats || {};
+      const mean    = band.mean;
+      const p       = band.percentiles || {};
+      const p25     = p["25.0"] ?? p["25"] ?? null;
+      const p75     = p["75.0"] ?? p["75"] ?? null;
+      const count   = band.sampleCount ?? 0;
+      const nodata  = band.noDataCount ?? 0;
+      const valid   = mean !== null && mean !== undefined && !isNaN(mean);
+      return {
+        date:         dateStr,
+        ndvi_mean:    valid   ? Math.round(mean * 1000) / 1000 : null,
+        ndvi_p25:     (p25 !== null && !isNaN(p25)) ? Math.round(p25 * 1000) / 1000 : null,
+        ndvi_p75:     (p75 !== null && !isNaN(p75)) ? Math.round(p75 * 1000) / 1000 : null,
+        sample_count: count - nodata,
+        valid,
+      };
+    });
+
+    return new Response(
+      JSON.stringify({ data }),
+      { status: 200, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+    );
+
+  } catch (e) {
+    return new Response(
+      JSON.stringify({ error: e.message }),
+      { status: 500, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+    );
+  }
+});
