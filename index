@@ -2474,6 +2474,13 @@ svg.gauge { width: 100%; overflow: visible; }
           <canvas id="sat-ndvi-chart" height="90"></canvas>
         </div>
 
+        <!-- NDWI time series chart -->
+        <div id="sat-ndwi-wrap" style="display:none;margin-top:8px">
+          <div style="font-size:0.60rem;color:var(--ink-5);font-family:var(--mono);
+               margin-bottom:3px">MONTHLY NDWI · 5-YEAR RECORD · flooded/irrigated signal (B08−B11)</div>
+          <canvas id="sat-ndwi-chart" height="70"></canvas>
+        </div>
+
         <!-- NPP & Cin summary -->
         <div id="sat-npp-strip" style="display:none;margin-top:8px;
              font-size:0.68rem;font-family:var(--mono);line-height:1.8">
@@ -6118,6 +6125,7 @@ const PHENOLOGY = {
 };
 
 let _satNDVIChart = null;  // Chart.js instance — destroyed & recreated on each fetch
+let _satNDWIChart = null;  // Chart.js instance for NDWI — destroyed & recreated on each fetch
 
 /* ── triggerSatelliteAnalysis: entry point from 🛰 Vegetation button ── */
 async function triggerSatelliteAnalysis() {
@@ -6311,6 +6319,7 @@ function applySatelliteResult(data) {
 
   // ── 6. Render UI ───────────────────────────────────────────────────────
   renderNDVIChart(data, ndviClim);
+  renderNDWIChart(data, ndwiClim);
   renderSatNPPStrip(annualNPP, Cin_field, Cin_ag, Cin_bg, Cin_rhizo, treeCin);
   renderPhenologyClassification(ndviClim, ndwiClim, ndreClim);
   renderSatScaleStrip(scaleFactor, baseInterviewCin, Cin_field);
@@ -6420,6 +6429,111 @@ function renderNDVIChart(data, ndviClim) {
         y: { min:0, max:1, title:{ display:true, text:'NDVI', font:{size:9} },
              ticks:{ stepSize:0.2, font:{size:9} }, grid:{ color:'rgba(0,0,0,0.05)' } },
         x: { ticks:{ font:{size:9} }, grid:{ display:false } }
+      }
+    }
+  });
+}
+
+/* ── renderNDWIChart: 5-year monthly NDWI time series ── */
+function renderNDWIChart(data, ndwiClim) {
+  const wrap   = document.getElementById('sat-ndwi-wrap');
+  const canvas = document.getElementById('sat-ndwi-chart');
+  if (!wrap || !canvas) return;
+
+  // Hide and bail if no NDWI data in this response (old cached data without B11)
+  const hasNDWI = data && data.some(d => d.ndwi_mean !== null && d.ndwi_mean !== undefined);
+  if (!hasNDWI || !ndwiClim) { wrap.style.display = 'none'; return; }
+
+  if (typeof Chart === 'undefined') {
+    let waited = 0;
+    const check = setInterval(() => {
+      waited += 100;
+      if (typeof Chart !== 'undefined') { clearInterval(check); renderNDWIChart(data, ndwiClim); }
+      else if (waited > 3000) { clearInterval(check); }
+    }, 100);
+    return;
+  }
+
+  wrap.style.display = 'block';
+  if (_satNDWIChart) { _satNDWIChart.destroy(); _satNDWIChart = null; }
+
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const climData = ndwiClim.map(v => v !== null ? parseFloat(v.toFixed(3)) : null);
+
+  // Per-year traces
+  const years = [...new Set(data.map(d => d.date.slice(0,4)))].sort().slice(-5);
+  const yearDatasets = years.map((yr, i) => {
+    const vals = new Array(12).fill(null);
+    data.filter(d => d.date.startsWith(yr)).forEach(d => {
+      if (d.ndwi_mean !== null && d.ndwi_mean !== undefined) {
+        const mo = parseInt(d.date.slice(5,7)) - 1;
+        vals[mo] = parseFloat(d.ndwi_mean.toFixed(3));
+      }
+    });
+    const alpha = 0.25 + (i / years.length) * 0.35;
+    return {
+      label:           yr,
+      data:            vals,
+      borderColor:     `rgba(30,80,160,${alpha})`,
+      backgroundColor: 'transparent',
+      borderWidth:     1,
+      pointRadius:     2,
+      tension:         0.3,
+      spanGaps:        true,
+    };
+  });
+
+  // Rice detection threshold reference line at NDWI = 0.05
+  // (Gao 1996, RSE; flooded/irrigated cropland threshold validated for S-Asia by Xiao et al. 2005 RSE)
+  const riceThreshData = new Array(12).fill(0.05);
+
+  _satNDWIChart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: MONTH_NAMES,
+      datasets: [
+        ...yearDatasets,
+        {
+          label:           '5-yr mean',
+          data:            climData,
+          borderColor:     '#1a50a0',
+          backgroundColor: 'rgba(26,80,160,0.08)',
+          borderWidth:     2.5,
+          pointRadius:     3,
+          tension:         0.3,
+          spanGaps:        true,
+          fill:            true,
+        },
+        {
+          label:           'Rice threshold (0.05)',
+          data:            riceThreshData,
+          borderColor:     'rgba(200,80,20,0.55)',
+          backgroundColor: 'transparent',
+          borderWidth:     1,
+          borderDash:      [4, 3],
+          pointRadius:     0,
+          tension:         0,
+          fill:            false,
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { display: true, position: 'top',
+                  labels: { font:{size:9}, color:'var(--ink-3)', padding:8 } },
+        tooltip: { callbacks: {
+          label: ctx => ` ${ctx.dataset.label}: NDWI ${ctx.parsed.y?.toFixed(2) ?? 'N/A'}`
+        }}
+      },
+      scales: {
+        y: { min: -0.4, max: 0.6,
+             // NDWI range: dry bare soil ≈ −0.3; dense dry canopy ≈ 0; flooded/irrigated ≥ 0.05; open water > 0.3
+             title: { display: true, text: 'NDWI', font:{size:9} },
+             ticks: { stepSize: 0.2, font:{size:9} },
+             grid: { color: 'rgba(0,0,0,0.05)' } },
+        x: { ticks: { font:{size:9} }, grid: { display: false } }
       }
     }
   });
