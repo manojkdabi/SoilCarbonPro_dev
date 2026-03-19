@@ -6,12 +6,14 @@
   <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
   <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
   <link rel="dns-prefetch" href="https://maps.isric.org">
-  <link rel="dns-prefetch" href="https://nominatim.openstreetmap.org">
+  <link rel="dns-prefetch" href="https://api.bigdatacloud.net">
   <link rel="dns-prefetch" href="https://api.opentopodata.org">
   <link rel="dns-prefetch" href="https://archive-api.open-meteo.com">
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SoilCarbon Pro — Target Solver v1.5.0</title>
+<!-- Inline favicon — prevents browser 404 for /favicon.ico on GitHub Pages -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E🌱%3C/text%3E%3C/svg%3E">
 
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -4513,19 +4515,28 @@ function onCoordChange() {
 
 async function reverseGeocode(lat, lon) {
   try {
-    const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`, {
-      headers: { 'Accept-Language': 'en' }
-    });
+    // BigDataCloud reverse-geocode-client: CORS-enabled, free, no API key required.
+    // Works from any browser origin including GitHub Pages.
+    const r = await fetch(
+      `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`,
+      { signal: AbortSignal.timeout(8000) }
+    );
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const d = await r.json();
-    const loc = d.address;
-    const parts = [loc.village||loc.town||loc.city||'', loc.district||loc.county||'', loc.state||'', loc.country||''].filter(Boolean);
+    // d.locality = village/town (most specific), d.city = city/tehsil,
+    // d.principalSubdivision = state, d.countryName = country
+    const parts = [
+      d.locality || d.city || '',
+      d.principalSubdivision || '',
+      d.countryName || ''
+    ].filter(Boolean);
     ST.locationName = parts.slice(0,3).join(', ');
     document.getElementById('location-name').textContent = ST.locationName;
     updateWizardSubLabels();
-    // Cache district + state for modal autofill — village deliberately excluded
-    // (Nominatim village ≠ revenue village; agent must enter that manually)
-    ST._geoDistrict = loc.district || loc.county || '';
-    ST._geoState    = loc.state    || '';
+    // Cache district + state for modal autofill — locality deliberately excluded
+    // (BigDataCloud locality ≠ revenue village; agent must enter that manually)
+    ST._geoDistrict = d.city || d.locality || '';
+    ST._geoState    = d.principalSubdivision || '';
   } catch(e) {
     document.getElementById('location-name').textContent = `${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E`;
   }
@@ -7775,19 +7786,20 @@ async function fetchSoilGrids() {
 ────────────────────────────────────────────────────────────────────────── */
 function showSoilGridsOutageMessage(status, btn, errMsg) {
   const isOutage = errMsg?.includes('503') || errMsg?.includes('502') ||
-                   errMsg?.includes('Failed to fetch') || errMsg?.includes('ERR_FAILED');
+                   errMsg?.includes('Failed to fetch') || errMsg?.includes('ERR_FAILED') ||
+                   errMsg?.includes('No data returned');
   const isCORS   = errMsg?.includes('CORS') || errMsg?.includes('origin');
 
   const msgTitle = isOutage
-    ? '⚠ SoilGrids servers are currently offline (ISRIC outage)'
+    ? '⚠ SoilGrids servers are currently unavailable (ISRIC 503 / outage)'
     : isCORS
-    ? '⚠ SoilGrids blocked — run from localhost instead of file://'
+    ? '⚠ SoilGrids CORS error — check browser console'
     : `⚠ Soil data unavailable — ${errMsg}`;
 
   const helpLine = isOutage
-    ? 'ISRIC has paused the API with no timeline. Enter values manually or retry later.'
+    ? 'ISRIC REST (rest.isric.org) returned 503. Enter values manually or retry in a few minutes.'
     : isCORS
-    ? 'Run: <code>python -m http.server 8080</code> then open http://localhost:8080'
+    ? 'CORS error — ensure the app is served over HTTPS (GitHub Pages is OK).'
     : 'Check coordinates are on land, then retry.';
 
   const btnStyle = 'border:none;border-radius:4px;padding:3px 10px;cursor:pointer;font-size:0.75rem;font-weight:600;margin:0 3px';
@@ -15097,7 +15109,7 @@ function hexToRgb(hex) {
       <g transform="translate(60,170)">
         <rect width="200" height="50" rx="8" fill="#151e15" stroke="#2d4b2d" stroke-width="1"/>
         <text x="100" y="20" text-anchor="middle" fill="#5aaf5a" font-size="10" font-weight="700" font-family="monospace">REVERSE GEOCODE</text>
-        <text x="100" y="34" text-anchor="middle" fill="#3d6b3d" font-size="8.5" font-family="monospace">Nominatim OpenStreetMap</text>
+        <text x="100" y="34" text-anchor="middle" fill="#3d6b3d" font-size="8.5" font-family="monospace">BigDataCloud Geocoder</text>
         <text x="100" y="46" text-anchor="middle" fill="#2d4b2d" font-size="8" font-family="monospace">→ ST.locationName display</text>
       </g>
       <line x1="160" y1="120" x2="160" y2="170" stroke="#3d6b3d" stroke-width="1.2" marker-end="url(#arr)"/>
@@ -15680,7 +15692,7 @@ CDR_revenue = CO₂e × $50 / t CO₂e  [USD/ha]</div>
 
       <div class="dev-section">MAP &amp; DATA INFRASTRUCTURE</div>
       <div class="dev-ref-item"><span class="dev-ref-num">33</span><div><strong>Leaflet.js v1.9.4</strong> — Interactive map, map pin, marker, tile layer (OpenStreetMap).</div></div>
-      <div class="dev-ref-item"><span class="dev-ref-num">34</span><div><strong>Nominatim (OpenStreetMap)</strong> — Reverse geocoding: lat/lon → location name display.</div></div>
+      <div class="dev-ref-item"><span class="dev-ref-num">34</span><div><strong>BigDataCloud Reverse Geocoder</strong> — Reverse geocoding: lat/lon → location name display. CORS-enabled, free, no API key required. <a href="https://www.bigdatacloud.com/geocoding-apis/free-reverse-geocode-to-city-api" target="_blank">bigdatacloud.com</a></div></div>
       <div class="dev-ref-item"><span class="dev-ref-num">35</span><div><strong>Chart.js v4.4.0</strong> — BAU trajectory chart, SOC recommendation trajectory, waterfall chart.</div></div>
       <div class="dev-ref-item"><span class="dev-ref-num">36</span><div><strong>jsPDF v2.5.1</strong> — Soil Test Request Sheet PDF + Prescription PDF generation.</div></div>
       <div class="dev-ref-item"><span class="dev-ref-num">37</span><div><strong>ISRIC SoilGrids v2 REST API</strong> — rest.isric.org/soilgrids/v2.0/properties/query. 9 soil properties at 250m resolution with mean + uncertainty.</div></div>
