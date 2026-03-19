@@ -9229,23 +9229,113 @@ function inferMineralogy(lat, lon) {
   return { key:'alluvial', conf:'low', reason:'Outside India — defaulting to alluvial reference' };
 }
 
-function applyMineralogyFromLocation(lat, lon) {
-  const result = inferMineralogy(lat, lon);
-  setMineralogy(result.key, 'auto');
+async function applyMineralogyFromLocation(lat, lon) {
+  const geo = inferMineralogy(lat, lon);
+  setMineralogy(geo.key, 'auto');
   const note = document.getElementById('mineral-autodetect');
   const text = document.getElementById('mineral-autodetect-text');
   if (note && text) {
-    const confIcon = result.conf === 'high' ? '📍' : result.conf === 'medium' ? '🟡' : '⚠';
-    text.textContent = `${confIcon} Auto-detected: ${result.reason}`;
+    const confIcon = geo.conf === 'high' ? '📍' : geo.conf === 'medium' ? '🟡' : '⚠';
+    text.textContent = `${confIcon} Auto-detected: ${geo.reason}`;
     note.style.display = 'block';
     // Colour by confidence
-    note.style.background = result.conf === 'high'   ? 'var(--teal-lt)'  :
-                             result.conf === 'medium' ? 'var(--blue-lt)'  : 'var(--amber-lt)';
-    note.style.borderColor = result.conf === 'high'   ? 'var(--teal)'    :
-                             result.conf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
-    note.style.color       = result.conf === 'high'   ? 'var(--teal)'    :
-                             result.conf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
+    note.style.background = geo.conf === 'high'   ? 'var(--teal-lt)'  :
+                             geo.conf === 'medium' ? 'var(--blue-lt)'  : 'var(--amber-lt)';
+    note.style.borderColor = geo.conf === 'high'   ? 'var(--teal)'    :
+                             geo.conf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
+    note.style.color       = geo.conf === 'high'   ? 'var(--teal)'    :
+                             geo.conf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
   }
+  // ── OpenLandMap RGB soil-colour fetch (non-blocking — geographic prior already applied above) ──
+  try {
+    const ctrl = new AbortController();
+    const _t = setTimeout(() => ctrl.abort(), 6000);
+    const resp = await fetch(
+      `https://api.openlandmap.org/query/point?lat=${lat}&lon=${lon}&properties=sol_color.rgb_visualising.sl1_m_250m_b0..0cm_1950..2017_v0.1`,
+      { signal: ctrl.signal }
+    );
+    clearTimeout(_t);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    // OpenLandMap may wrap in a GeoJSON Feature or return bare properties
+    const props = data?.properties ?? data;
+    const val = props?.['sol_color.rgb_visualising.sl1_m_250m_b0..0cm_1950..2017_v0.1'];
+    const R = Array.isArray(val) ? val[0] : (val?.red   ?? val?.r);
+    const G = Array.isArray(val) ? val[1] : (val?.green ?? val?.g);
+    const B = Array.isArray(val) ? val[2] : (val?.blue  ?? val?.b);
+    if (R == null || G == null || B == null ||
+        +R < 0 || +R > 255 || +G < 0 || +G > 255 || +B < 0 || +B > 255) return;
+    applySoilColorRGB(+R, +G, +B, geo);
+  } catch (_) { /* OpenLandMap unavailable — geographic prior remains */ }
+}
+
+// Classifies actual surface RGB from OpenLandMap and upgrades the geographic mineralogy prior.
+// Called asynchronously after the initial geographic classification is already displayed.
+function applySoilColorRGB(R, G, B, geo) {
+  const maxC   = Math.max(R, G, B);
+  const sumC   = (R + G + B) || 1;
+  const redRat = R / sumC;
+
+  // ── RGB → mineral key ──
+  let rgbKey = null, rgbConf = 'medium';
+  if (maxC < 70) {
+    // Very dark soil → Black Cotton Vertisol
+    rgbKey  = 'vertisol';
+    rgbConf = maxC < 50 ? 'high' : 'medium';
+  } else if (redRat > 0.42 && R > 120) {
+    // Red-dominant → Red / Lateritic Alfisol
+    rgbKey  = 'alfisol';
+    rgbConf = redRat > 0.46 ? 'high' : 'medium';
+  } else if (maxC > 170 && redRat < 0.36) {
+    // Pale / sandy — conservative (calcic or sandy; lower confidence)
+    rgbKey  = 'aridisol';
+    rgbConf = 'low';
+  }
+
+  // ── Decide whether to override geographic prior ──
+  // Override only when geographic confidence is low, or when a non-low RGB result
+  // clearly disagrees with a medium-confidence geographic result.
+  // High-confidence geographic results (e.g. clear Deccan Trap bounding box) are preserved.
+  const shouldOverride = rgbKey && (
+    geo.conf === 'low' ||
+    (geo.conf === 'medium' && rgbKey !== geo.key && rgbConf !== 'low')
+  );
+
+  if (shouldOverride) {
+    const labelMap = {
+      vertisol: 'very dark → Black Cotton (Vertisol)',
+      alfisol:  'red-dominant → Red Lateritic (Alfisol)',
+      aridisol: 'pale/sandy → Desert / Arid (Aridisol)'
+    };
+    setMineralogy(rgbKey, 'auto');
+    const note = document.getElementById('mineral-autodetect');
+    const text = document.getElementById('mineral-autodetect-text');
+    if (note && text) {
+      const confIcon = rgbConf === 'high' ? '📍' : rgbConf === 'medium' ? '🟡' : '⚠';
+      text.textContent = `${confIcon} Auto-detected: 🎨 RGB(${R},${G},${B}) — ${labelMap[rgbKey]}`;
+      note.style.background = rgbConf === 'high'   ? 'var(--teal-lt)'  :
+                               rgbConf === 'medium' ? 'var(--blue-lt)'  : 'var(--amber-lt)';
+      note.style.borderColor = rgbConf === 'high'   ? 'var(--teal)'    :
+                               rgbConf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
+      note.style.color       = rgbConf === 'high'   ? 'var(--teal)'    :
+                               rgbConf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
+    }
+  }
+
+  // ── Always render a soil colour swatch in the auto-detect note ──
+  const note = document.getElementById('mineral-autodetect');
+  if (!note) return;
+  let swatch = document.getElementById('mineral-soil-swatch');
+  if (!swatch) {
+    swatch = document.createElement('span');
+    swatch.id = 'mineral-soil-swatch';
+    swatch.style.cssText = 'display:inline-block;width:13px;height:13px;border-radius:3px;' +
+      'border:1px solid rgba(0,0,0,0.22);vertical-align:middle;margin-right:6px;flex-shrink:0;' +
+      'box-shadow:0 1px 2px rgba(0,0,0,0.18)';
+    note.insertBefore(swatch, note.firstChild);
+  }
+  swatch.style.background = `rgb(${R},${G},${B})`;
+  swatch.title = `OpenLandMap surface soil colour · RGB(${R},${G},${B})`;
 }
 
 function setMineralogy(m, source) {
