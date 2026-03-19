@@ -3027,6 +3027,7 @@ svg.gauge { width: 100%; overflow: visible; }
            font-family:var(--mono);color:var(--teal);line-height:1.5">
         <span id="mineral-autodetect-text"></span>
         <span style="margin-left:10px;opacity:0.65">· Click any card above to override</span>
+        <div id="mineral-rgb-line" style="display:none;margin-top:5px;font-size:0.72rem;opacity:0.9;border-top:1px solid rgba(0,0,0,0.08);padding-top:4px"></div>
       </div>
     </div>
 
@@ -9247,6 +9248,13 @@ async function applyMineralogyFromLocation(lat, lon) {
                              geo.conf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
   }
   // ── OpenLandMap RGB soil-colour fetch (non-blocking — geographic prior already applied above) ──
+  // Always show the RGB line immediately so the user can see its status
+  const rgbLineEl = document.getElementById('mineral-rgb-line');
+  if (rgbLineEl) {
+    rgbLineEl.textContent = '🎨 Fetching OpenLandMap soil colour…';
+    rgbLineEl.style.display = 'block';
+  }
+  let rgbFetched = false;
   try {
     const ctrl = new AbortController();
     const _t = setTimeout(() => ctrl.abort(), 6000);
@@ -9255,7 +9263,10 @@ async function applyMineralogyFromLocation(lat, lon) {
       { signal: ctrl.signal }
     );
     clearTimeout(_t);
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      if (rgbLineEl) rgbLineEl.textContent = `🎨 OpenLandMap unavailable (HTTP ${resp.status}) — geographic prior kept`;
+      return;
+    }
     const data = await resp.json();
     // OpenLandMap may wrap in a GeoJSON Feature or return bare properties
     const props = data?.properties ?? data;
@@ -9264,9 +9275,16 @@ async function applyMineralogyFromLocation(lat, lon) {
     const G = Array.isArray(val) ? val[1] : (val?.green ?? val?.g);
     const B = Array.isArray(val) ? val[2] : (val?.blue  ?? val?.b);
     if (R == null || G == null || B == null ||
-        +R < 0 || +R > 255 || +G < 0 || +G > 255 || +B < 0 || +B > 255) return;
+        +R < 0 || +R > 255 || +G < 0 || +G > 255 || +B < 0 || +B > 255) {
+      if (rgbLineEl) rgbLineEl.textContent = '🎨 OpenLandMap returned no colour data — geographic prior kept';
+      return;
+    }
+    rgbFetched = true;
     applySoilColorRGB(+R, +G, +B, geo);
-  } catch (_) { /* OpenLandMap unavailable — geographic prior remains */ }
+  } catch (err) {
+    const msg = err?.name === 'AbortError' ? 'request timed out' : 'network error';
+    if (rgbLineEl) rgbLineEl.textContent = `🎨 OpenLandMap ${msg} — geographic prior kept`;
+  }
 }
 
 // Classifies actual surface RGB from OpenLandMap and upgrades the geographic mineralogy prior.
@@ -9274,6 +9292,7 @@ async function applyMineralogyFromLocation(lat, lon) {
 function applySoilColorRGB(R, G, B, geo) {
   const note = document.getElementById('mineral-autodetect');
   const text = document.getElementById('mineral-autodetect-text');
+  const rgbLine = document.getElementById('mineral-rgb-line');
   if (!note || !text) return;
 
   const maxC   = Math.max(R, G, B);
@@ -9283,15 +9302,12 @@ function applySoilColorRGB(R, G, B, geo) {
   // ── RGB → mineral key ──
   let rgbKey = null, rgbConf = 'medium';
   if (maxC < 70) {
-    // Very dark soil → Black Cotton Vertisol
     rgbKey  = 'vertisol';
     rgbConf = maxC < 50 ? 'high' : 'medium';
   } else if (redRat > 0.42 && R > 120) {
-    // Red-dominant → Red / Lateritic Alfisol
     rgbKey  = 'alfisol';
     rgbConf = redRat > 0.46 ? 'high' : 'medium';
   } else if (maxC > 170 && redRat < 0.36) {
-    // Pale / sandy — conservative (calcic or sandy; lower confidence)
     rgbKey  = 'aridisol';
     rgbConf = 'low';
   }
@@ -9316,9 +9332,6 @@ function applySoilColorRGB(R, G, B, geo) {
   };
 
   // ── Decide whether to override geographic prior ──
-  // Override only when geographic confidence is low, or when a non-low RGB result
-  // clearly disagrees with a medium-confidence geographic result.
-  // High-confidence geographic results (e.g. clear Deccan Trap bounding box) are preserved.
   const shouldOverride = rgbKey && (
     geo.conf === 'low' ||
     (geo.conf === 'medium' && rgbKey !== geo.key && rgbConf !== 'low')
@@ -9335,22 +9348,17 @@ function applySoilColorRGB(R, G, B, geo) {
                              rgbConf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
     note.style.color       = rgbConf === 'high'  ? 'var(--teal)'     :
                              rgbConf === 'medium' ? 'var(--blue)'     : 'var(--amber)';
+    // RGB overrides geo — hide secondary RGB line (info is in main text)
+    if (rgbLine) rgbLine.style.display = 'none';
   } else {
-    // RGB confirms or is inconclusive — append RGB reading to the existing geo note line
-    const rgbLine = rgbKey
+    // RGB confirms or is inconclusive — always update the secondary RGB line
+    const rgbText = rgbKey
       ? `🎨 RGB(${R},${G},${B}) — ${labelMap[rgbKey]} (confirms geographic)`
       : `🎨 RGB(${R},${G},${B}) — colour inconclusive; geographic prior kept`;
-    // Append RGB reading as a secondary line inside the note
-    let rgbSpan = document.getElementById('mineral-rgb-line');
-    if (!rgbSpan) {
-      rgbSpan = document.createElement('div');
-      rgbSpan.id = 'mineral-rgb-line';
-      rgbSpan.style.cssText = 'margin-top:4px;opacity:0.85;font-size:0.72rem';
-      // Insert before the "Click any card" hint (last element child)
-      const hint = note.lastElementChild;
-      note.insertBefore(rgbSpan, hint !== text ? hint : null);
+    if (rgbLine) {
+      rgbLine.textContent = rgbText;
+      rgbLine.style.display = 'block';
     }
-    rgbSpan.textContent = rgbLine;
     note.style.display = 'block';
   }
 }
